@@ -3,3 +3,4 @@ mss
 numpy
 pystray
 Pillow
+psutil

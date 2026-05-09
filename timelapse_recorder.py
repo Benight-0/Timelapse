@@ -1,16 +1,19 @@
 import argparse
+import ctypes
 import math
 import shutil
 import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import mss
 import numpy as np
+import psutil
 import pystray
 import tkinter as tk
 from PIL import Image, ImageDraw
@@ -59,11 +62,14 @@ class TimelapseRecorder:
 
         self._start_ts: Optional[float] = None
         self._writer: Optional[cv2.VideoWriter] = None
+        self._writer_frame_size: Optional[Tuple[int, int]] = None
         self._last_live_frame: Optional[np.ndarray] = None
         self._frames_written = 0
         self._frames_captured = 0
         self._time_scale_accumulator = 0.0
         self._error: Optional[str] = None
+        self._summary_tail_payload: Optional[dict] = None
+        self._summary_tail_seconds = 5.0
 
     @property
     def interval_seconds(self) -> float:
@@ -76,7 +82,8 @@ class TimelapseRecorder:
         self._thread = threading.Thread(target=self._record_loop, daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, summary_tail_payload: Optional[dict] = None) -> None:
+        self._summary_tail_payload = summary_tail_payload
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=10)
@@ -149,6 +156,9 @@ class TimelapseRecorder:
                     next_tick += self.interval_seconds
                     if next_tick < time.monotonic() - self.interval_seconds:
                         next_tick = time.monotonic() + self.interval_seconds
+
+                if self._writer is not None and self._summary_tail_payload is not None:
+                    self._write_summary_tail(self._summary_tail_payload, self._summary_tail_seconds)
         except Exception as exc:
             self._error = str(exc)
             self._stop_event.set()
@@ -183,6 +193,7 @@ class TimelapseRecorder:
         if self._writer is not None:
             return
         h, w = frame.shape[:2]
+        self._writer_frame_size = (w, h)
         fourcc = self._codec_from_format(self.config.video_format)
         self.config.temp_output_path.parent.mkdir(parents=True, exist_ok=True)
         self._writer = cv2.VideoWriter(
@@ -201,6 +212,7 @@ class TimelapseRecorder:
         if self._writer is not None:
             self._writer.release()
             self._writer = None
+            self._writer_frame_size = None
 
     @staticmethod
     def _codec_from_format(video_format: str) -> int:
@@ -295,17 +307,195 @@ class TimelapseRecorder:
         )
         return frame
 
+    def _write_summary_tail(self, payload: dict, seconds: float) -> None:
+        if self._writer is None:
+            return
+
+        if self._writer_frame_size is not None:
+            frame_w, frame_h = self._writer_frame_size
+        else:
+            frame_w = int(self._writer.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280)
+            frame_h = int(self._writer.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720)
+        duration = max(0.0, float(payload.get("elapsed_seconds", 0.0)))
+        total_app_seconds = int(payload.get("total_app_seconds", 0))
+        rows = list(payload.get("app_rows", []))
+        paused_seconds = max(0.0, duration - float(total_app_seconds))
+
+        frame = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+        frame[:, :] = (18, 18, 28)
+
+        cv2.putText(
+            frame,
+            "Session Summary",
+            (42, 66),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.15,
+            (240, 240, 245),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            f"Session Time: {format_duration(duration)}  |  Paused Time: {format_duration(paused_seconds)}",
+            (42, 104),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (196, 211, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            f"Tracked App Focus Time: {format_duration(total_app_seconds)}",
+            (42, 132),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (179, 255, 205),
+            1,
+            cv2.LINE_AA,
+        )
+
+        y = 180
+        cv2.putText(
+            frame,
+            "Top Apps During Recording",
+            (42, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (235, 235, 245),
+            2,
+            cv2.LINE_AA,
+        )
+        y += 34
+
+        if not rows:
+            cv2.putText(
+                frame,
+                "No app activity captured.",
+                (42, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (200, 200, 210),
+                1,
+                cv2.LINE_AA,
+            )
+        else:
+            max_rows = min(12, len(rows))
+            for idx in range(max_rows):
+                app_name, app_seconds = rows[idx]
+                line = f"{idx + 1:>2}. {app_name[:52]:<52}  {format_duration(int(app_seconds))}"
+                cv2.putText(
+                    frame,
+                    line,
+                    (42, y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.56,
+                    (210, 210, 220),
+                    1,
+                    cv2.LINE_AA,
+                )
+                y += 28
+
+        repeats = max(1, int(round(self.config.output_fps * max(0.1, seconds))))
+        for _ in range(repeats):
+            self._writer.write(frame)
+            self._frames_written += 1
+
+
+class ActiveAppTracker:
+    def __init__(self, sample_interval_seconds: float = 1.0):
+        self.sample_interval_seconds = max(0.2, sample_interval_seconds)
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._start_ts: Optional[float] = None
+        self._active_app = "Unknown"
+        self._paused = False
+        self._usage_seconds: Dict[str, int] = defaultdict(int)
+
+    def start(self, reset: bool = True) -> None:
+        if self.is_running():
+            return
+        if reset:
+            self.reset()
+        self._stop_event.clear()
+        self._start_ts = time.monotonic()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._active_app = "Unknown"
+            self._paused = False
+            self._usage_seconds.clear()
+            self._start_ts = None
+
+    def set_paused(self, paused: bool) -> None:
+        with self._lock:
+            self._paused = paused
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
+
+    def elapsed_seconds(self) -> float:
+        with self._lock:
+            if self._start_ts is None:
+                return 0.0
+            return max(0.0, time.monotonic() - self._start_ts)
+
+    def get_snapshot(self) -> Tuple[str, int, List[Tuple[str, int]]]:
+        with self._lock:
+            active_app = self._active_app
+            rows = sorted(self._usage_seconds.items(), key=lambda item: item[1], reverse=True)
+            total = sum(self._usage_seconds.values())
+        return active_app, total, rows
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            with self._lock:
+                paused = self._paused
+            if paused:
+                if self._stop_event.wait(self.sample_interval_seconds):
+                    break
+                continue
+            app_name = self._get_active_app_name()
+            with self._lock:
+                self._active_app = app_name
+                self._usage_seconds[app_name] += 1
+            if self._stop_event.wait(self.sample_interval_seconds):
+                break
+
+    def _get_active_app_name(self) -> str:
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return "Unknown"
+            pid = ctypes.c_ulong(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if not pid.value:
+                return "Unknown"
+            return psutil.Process(pid.value).name()
+        except Exception:
+            return "Unknown"
+
 
 class TrayTimelapseApp:
     def __init__(self, app_config: AppConfig):
         self.app_config = app_config
         self.recorder: Optional[TimelapseRecorder] = None
+        self.app_tracker = ActiveAppTracker(sample_interval_seconds=1.0)
         self.closing = False
 
         self.root = tk.Tk()
         self.root.title("Timelapse Mini Dashboard")
-        self.root.geometry("470x295")
-        self.root.resizable(False, False)
+        self.root.geometry("700x560")
+        self.root.resizable(True, True)
         self.root.configure(bg="#0F172A")
         self.root.protocol("WM_DELETE_WINDOW", self.hide_dashboard)
 
@@ -315,10 +505,14 @@ class TrayTimelapseApp:
         self.scale_var = tk.StringVar(value="Auto Bar Window: 00:01:00")
         self.speed_var = tk.StringVar(value=f"{self.app_config.default_speed_factor:.2f}")
         self.progress_var = tk.DoubleVar(value=0.0)
+        self.tracker_active_app_var = tk.StringVar(value="Tracker active app: Unknown")
+        self.tracker_total_var = tk.StringVar(value="Tracked app time: 00:00:00")
+        self.tracker_status_var = tk.StringVar(value="Tracker: idle")
 
-        self.start_btn: Optional[tk.Button] = None
-        self.pause_btn: Optional[tk.Button] = None
-        self.stop_btn: Optional[tk.Button] = None
+        self.start_btn: Optional[ttk.Button] = None
+        self.pause_btn: Optional[ttk.Button] = None
+        self.stop_btn: Optional[ttk.Button] = None
+        self.apps_tree: Optional[ttk.Treeview] = None
         self._build_dashboard()
         self.hide_dashboard()
 
@@ -339,6 +533,48 @@ class TrayTimelapseApp:
             lightcolor="#22C55E",
             darkcolor="#15803D",
             thickness=18,
+        )
+        style.configure(
+            "Tracker.Treeview",
+            background="#0B1220",
+            fieldbackground="#0B1220",
+            foreground="#E2E8F0",
+            bordercolor="#334155",
+            rowheight=26,
+            relief="flat",
+            font=("Segoe UI", 9),
+        )
+        style.map(
+            "Tracker.Treeview",
+            background=[("selected", "#1E3A8A")],
+            foreground=[("selected", "#F8FAFC")],
+        )
+        style.configure(
+            "Tracker.Treeview.Heading",
+            background="#111827",
+            foreground="#BFDBFE",
+            bordercolor="#334155",
+            relief="flat",
+            font=("Segoe UI Semibold", 9),
+        )
+        style.map(
+            "Tracker.Treeview.Heading",
+            background=[("active", "#1F2937")],
+            foreground=[("active", "#DBEAFE")],
+        )
+        style.configure(
+            "Tracker.Vertical.TScrollbar",
+            background="#1F2937",
+            troughcolor="#0F172A",
+            bordercolor="#334155",
+            arrowcolor="#CBD5E1",
+            darkcolor="#111827",
+            lightcolor="#1F2937",
+        )
+        style.configure(
+            "Session.TButton",
+            font=("Segoe UI Semibold", 10),
+            padding=(14, 8),
         )
 
         container = tk.Frame(self.root, bg="#0F172A")
@@ -397,6 +633,44 @@ class TrayTimelapseApp:
             length=430,
         ).pack(padx=14, pady=(0, 8))
 
+        controls_card = tk.Frame(container, bg="#111827", highlightbackground="#334155", highlightthickness=1)
+        controls_card.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Label(
+            controls_card,
+            text="Session Controls",
+            fg="#E2E8F0",
+            bg="#111827",
+            font=("Segoe UI Semibold", 10),
+        ).pack(anchor="w", padx=10, pady=(8, 6))
+        buttons = tk.Frame(controls_card, bg="#111827")
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        self.start_btn = ttk.Button(
+            buttons,
+            text="Start Session",
+            style="Session.TButton",
+            command=self.start_recording,
+        )
+        self.start_btn.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        self.pause_btn = ttk.Button(
+            buttons,
+            text="Pause",
+            style="Session.TButton",
+            command=self.pause_resume,
+            state="disabled",
+        )
+        self.pause_btn.grid(row=0, column=1, padx=8, sticky="ew")
+        self.stop_btn = ttk.Button(
+            buttons,
+            text="Stop Session",
+            style="Session.TButton",
+            command=self.stop_recording,
+            state="disabled",
+        )
+        self.stop_btn.grid(row=0, column=2, padx=(8, 0), sticky="ew")
+        buttons.grid_columnconfigure(0, weight=1)
+        buttons.grid_columnconfigure(1, weight=1)
+        buttons.grid_columnconfigure(2, weight=1)
+
         info_wrap = tk.Frame(container, bg="#0F172A")
         info_wrap.pack(fill="x", padx=14, pady=(0, 8))
         tk.Label(info_wrap, textvariable=self.elapsed_var, fg="#E2E8F0", bg="#0F172A", font=("Consolas", 11)).pack(
@@ -415,17 +689,63 @@ class TrayTimelapseApp:
             fg="#94A3B8",
             bg="#0F172A",
             font=("Segoe UI", 9),
-        ).pack(padx=14, pady=(0, 10))
+        ).pack(padx=14, pady=(0, 8))
 
-        buttons = tk.Frame(container, bg="#0F172A")
-        buttons.pack(padx=14, pady=(0, 12))
+        tracker_card = tk.Frame(container, bg="#111827", highlightbackground="#334155", highlightthickness=1)
+        tracker_card.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        tk.Label(
+            tracker_card,
+            text="App Tracker (this recording)",
+            fg="#E2E8F0",
+            bg="#111827",
+            font=("Segoe UI Semibold", 10),
+        ).pack(anchor="w", padx=10, pady=(8, 2))
+        tk.Label(
+            tracker_card,
+            textvariable=self.tracker_status_var,
+            fg="#86EFAC",
+            bg="#111827",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", padx=10, pady=(0, 2))
+        tk.Label(
+            tracker_card,
+            textvariable=self.tracker_active_app_var,
+            fg="#BFDBFE",
+            bg="#111827",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", padx=10, pady=(0, 2))
+        tk.Label(
+            tracker_card,
+            textvariable=self.tracker_total_var,
+            fg="#C4B5FD",
+            bg="#111827",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", padx=10, pady=(0, 6))
 
-        self.start_btn = tk.Button(buttons, text="Start", width=10, command=self.start_recording)
-        self.start_btn.grid(row=0, column=0, padx=6)
-        self.pause_btn = tk.Button(buttons, text="Pause", width=10, command=self.pause_resume, state="disabled")
-        self.pause_btn.grid(row=0, column=1, padx=6)
-        self.stop_btn = tk.Button(buttons, text="Stop", width=10, command=self.stop_recording, state="disabled")
-        self.stop_btn.grid(row=0, column=2, padx=6)
+        columns = ("app", "used")
+        tree_wrap = tk.Frame(tracker_card, bg="#111827")
+        tree_wrap.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.apps_tree = ttk.Treeview(
+            tree_wrap,
+            columns=columns,
+            show="headings",
+            height=9,
+            style="Tracker.Treeview",
+        )
+        self.apps_tree.heading("app", text="Application")
+        self.apps_tree.heading("used", text="Time Used")
+        self.apps_tree.column("app", width=430, anchor="w")
+        self.apps_tree.column("used", width=120, anchor="e")
+        tree_scroll = ttk.Scrollbar(
+            tree_wrap,
+            orient="vertical",
+            command=self.apps_tree.yview,
+            style="Tracker.Vertical.TScrollbar",
+        )
+        self.apps_tree.configure(yscrollcommand=tree_scroll.set)
+        self.apps_tree.pack(side="left", fill="both", expand=True)
+        tree_scroll.pack(side="right", fill="y")
+
 
     def _create_tray_image(self) -> Image.Image:
         img = Image.new("RGB", (64, 64), "#0F172A")
@@ -495,6 +815,7 @@ class TrayTimelapseApp:
         recorder = TimelapseRecorder(self._new_recorder_config(speed_factor))
         recorder.start()
         self.recorder = recorder
+        self.app_tracker.start(reset=True)
         self.status_var.set("RECORDING")
         self._refresh_button_states()
         self._update_tray_menu()
@@ -502,7 +823,8 @@ class TrayTimelapseApp:
     def pause_resume(self) -> None:
         if not self._is_recording() or self.recorder is None:
             return
-        self.recorder.toggle_pause()
+        paused = self.recorder.toggle_pause()
+        self.app_tracker.set_paused(paused)
         self._refresh_button_states()
         self._update_tray_menu()
 
@@ -513,8 +835,16 @@ class TrayTimelapseApp:
         if self.recorder is None:
             return
         recorder = self.recorder
-        recorder.stop()
+        active_app, total_app_seconds, app_rows = self.app_tracker.get_snapshot()
+        summary_payload = {
+            "active_app": active_app,
+            "total_app_seconds": total_app_seconds,
+            "app_rows": app_rows,
+            "elapsed_seconds": recorder.elapsed_seconds(),
+        }
+        recorder.stop(summary_tail_payload=summary_payload)
         self.recorder = None
+        self.app_tracker.stop()
         self._refresh_button_states()
         self._update_tray_menu()
 
@@ -572,6 +902,7 @@ class TrayTimelapseApp:
             if err is not None:
                 messagebox.showerror("Timelapse Recorder Error", err)
                 self.recorder = None
+                self.app_tracker.stop()
                 self._refresh_button_states()
                 self._update_tray_menu()
             else:
@@ -597,7 +928,26 @@ class TrayTimelapseApp:
             self.scale_var.set("Auto Bar Window: 00:01:00 (000.0% filled)")
             self._refresh_button_states()
 
+        self._refresh_tracker_status()
+
         self.root.after(500, self._schedule_status_refresh)
+
+    def _refresh_tracker_status(self) -> None:
+        if self.app_tracker.is_running():
+            self.tracker_status_var.set("Tracker: running")
+        else:
+            self.tracker_status_var.set("Tracker: idle")
+
+        active_app, total_seconds, rows = self.app_tracker.get_snapshot()
+        self.tracker_active_app_var.set(f"Tracker active app: {active_app}")
+        self.tracker_total_var.set(f"Tracked app time: {format_duration(total_seconds)}")
+
+        if self.apps_tree is None:
+            return
+
+        self.apps_tree.delete(*self.apps_tree.get_children())
+        for app_name, seconds in rows:
+            self.apps_tree.insert("", "end", values=(app_name, format_duration(seconds)))
 
     def _tray_show_dashboard(self, _icon, _item) -> None:
         self.root.after(0, self.show_dashboard)
@@ -620,6 +970,7 @@ class TrayTimelapseApp:
         self.closing = True
         if self.recorder is not None:
             self._stop_recording_with_save_prompt()
+        self.app_tracker.stop()
         self.tray_icon.stop()
         self.root.quit()
         self.root.destroy()
